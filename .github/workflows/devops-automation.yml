@@ -1,0 +1,109 @@
+name: Production CI/CD for Java Palindrome
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: java-palindrome-number
+  EKS_CLUSTER_NAME: my-eks-cluster
+  K8S_DEPLOYMENT_NAME: java-palindrome-number-deployment
+
+jobs:
+  build-test:
+    name: Build, Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Checkstyle Linter
+        run: mvn checkstyle:check
+
+      - name: Build, and Test with Maven
+        run: mvn -B verify
+
+  build-push-ecr:
+    name: Build & Push Docker Image to ECR
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.get-image-tag.outputs.IMAGE_TAG }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubAction-ECR-EKS
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it does not exist
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} > /dev/null 2>&1 || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }}
+
+      - name: Get image tag (Git SHA)
+        id: get-image-tag
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.get-image-tag.outputs.IMAGE_TAG }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+  deploy-eks:
+    name: Deploy to Amazon EKS
+    needs: build-push-ecr
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubAction-ECR-EKS
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up kubectl
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          kubectl version --short --client
+
+      - name: Substitute environment variables in Kubernetes manifests
+        run: |
+          sed -i "s|ECR_REGISTRY|${{ needs.build-push-ecr.outputs.ecr_registry }}|g" deployment.yaml
+          sed -i "s|IMAGE_TAG|${{ needs.build-push-ecr.outputs.image_tag }}|g" deployment.yaml
+
+      - name: Deploy to EKS
+        run: |
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+
+      - name: Verify deployment rollout
+        run: kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT_NAME }} --timeout=120s
